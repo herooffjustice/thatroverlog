@@ -1,0 +1,8 @@
+streamlit>=1.66
+pdfplumber
+pymupdf
+rank_bm25
+faiss-cpu
+fastembed
+numpy
+requests

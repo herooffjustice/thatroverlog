@@ -1,0 +1,81 @@
+# Everything shown on the home page that is not the activity log lives here.
+# Edit the text freely. The workflow list is in data/log.csv.
+
+kicker = "Major project, Department of AI & ML, Global Academy of Technology"
+name = "Autonomous Mobile Rover"
+tagline = "A 4-wheel rover that maps an unknown room with one LiDAR and drives itself to any point on that map."
+intro = """
+Everything runs on a Raspberry Pi 5 on the rover: the LiDAR driver, laser odometry, \
+SLAM Toolbox for mapping and Nav2 for path planning. We first built the same rover in \
+simulation, then moved the software to the real robot and fixed the problems the \
+simulation never showed. One use we have in mind: mapping a building after a disaster, \
+before people go in."""
+
+map_note = """Try it: click anywhere on the map to send the rover a goal. It plans a path, drives there, \
+and fills in the map from what its LiDAR sees. This is a small browser version of what our real rover \
+does with SLAM Toolbox and Nav2. The room is made up, but the rover's size (30 × 26 cm) is real."""
+
+college = "Department of AI & ML, Global Academy of Technology, Bengaluru"
+team = ["Abdul Rahman Khan", "M. Yashwanth", "Pranav Pujari"]
+guide = "Prof. Vijaya Dalawai, Assistant Professor, Dept of AIML"
+
+# Short facts shown under the title.
+specs = [
+  ["Computer", "Raspberry Pi 5, 4 GB"],
+  ["Sensor", "RPLiDAR A1M8, 360° 2D"],
+  ["Drive", "4WD skid steer, 4 BO motors"],
+  ["Size", "28 × 24.5 cm"],
+  ["Battery", "3S LiPo, 2200 mAh"],
+  ["Software", "ROS 2 Jazzy, SLAM Toolbox, Nav2"],
+]
+
+# Results on the real rover, measured from the Nav2 and Pi logs.
+results = [
+  ["20/20", "goals reached in the final run, with no LiDAR drops"],
+  ["16/20", "in the first test run. 3 misses were LiDAR drops from motor noise, 1 was a stalled tight turn"],
+  ["34+ m", "driven on its own in the first run, longest trip 5.4 m"],
+  ["11 ms", "WiFi delay to the Pi, down from 1190 ms with 90% packets lost"],
+]
+results_note = """The first run showed exactly what to fix. The noise capacitors and our own LiDAR cable \
+stopped the drops, and the turning fixes stopped the stalls. Both counts come from the Nav2 log on the Pi."""
+
+# The pipeline, in order.
+pipeline = [
+  ["LiDAR", "Scans the room 360°, about 7 times a second."],
+  ["Laser odometry", "Compares each scan with the last one to see how far the rover moved. No wheel encoders needed."],
+  ["SLAM", "Builds the map in 5 cm squares and corrects the rover's position on it."],
+  ["Nav2", "Plans a safe path to the clicked goal and follows it."],
+  ["Motor node", "Turns speed commands into power for the left and right wheels."],
+]
+
+# Sim-to-real lessons: problems the simulation never showed, most important first.
+lessons = [
+  ["The LiDAR's connection cable was missing", "Built our own cable. The official pin labels did not match the adapter board on 3 pins, so we checked every wire with a multimeter continuity test before soldering."],
+  ["Motor noise knocked out the LiDAR's USB in turns", "Soldered noise-filter capacitors on all 4 motors, the motor driver and the 5 V converter, refitted our own cable, and wrote a guard that resets the LiDAR's USB and restarts it on its own."],
+  ["Odometry ran backwards", "Our LiDAR faces backwards, and on the Pi the odometry started before it knew that. A scan gate now holds back the scans until the LiDAR's position is known."],
+  ["Skid-steer turns stalled halfway", "Measured the power a turn needs (32-35% just to start), then gave each turn a short 42% kick, steady turning power after it, and a fresh kick every 1.5 s."],
+  ["The rover drifted off the path on curves", "The two sides differed by only 8% power on Nav2's sharpest curve. Raised the curve gain from 2.0 to 6.0, so they now differ by about 25% and the rover follows the path."],
+  ["Hardware PWM failed on the Pi 5", "Found that the Pi 5's PWM overlay needs an explicit clock setting, and mapped our GPIO18 and GPIO19 pins to the right PWM channels."],
+  ["RViz showed the scans, but no map and no rover", "Traced it to a network setting that pushed large messages (the map, the rover model) through WSL's network, where they failed. Removing it fixed both."],
+  ["Navigation froze when the laptop ran it over WiFi", "Moved SLAM and Nav2 onto the Pi itself, so the rover keeps mapping and driving even when WiFi is weak. The laptop only shows the map."],
+  ["WiFi delay of 1.2 s, with 90% of packets lost", "Traced it to the Pi's WiFi chip sleeping between packets (power-save mode). A boot-time job now keeps it awake: delay fell to 11 ms, with no packets lost."],
+]
+
+# Current status.
+working = ["Manual driving with the keyboard", "Live mapping (SLAM) on the Pi", "Navigation to goals on live and saved maps", "Automatic LiDAR recovery", "The same software in the Gazebo twin"]
+in_progress = ["Front wheels rolling better in turns", "Left side slightly weaker than the right"]
+paused = ["IMU (MPU6050), until motor noise is fixed in hardware"]
+
+# Videos: paste YouTube links (set the video to Unlisted on YouTube).
+# Leave url empty to hide a video.
+[[videos]]
+title = "Real rover: mapping and reaching goals"
+url = ""
+
+[[videos]]
+title = "Gazebo twin: the same software in simulation"
+url = ""
+
+[[videos]]
+title = "Isaac Sim: warehouse rover with potential-field navigation"
+url = ""

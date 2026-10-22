@@ -1,0 +1,322 @@
+<!--
+  A small, live version of what our rover does, drawn in the browser:
+  a 2D LiDAR scans the room, the map fills in (grey = not seen yet, white = free, dark = wall),
+  and when you click a point, the rover plans a path (A*, like Nav2's planner) and drives there.
+  The room is made up. The rover's size (30 x 26 cm) and LiDAR range are close to the real one.
+-->
+<div class="lm-wrap" id="lm-root">
+  <canvas class="lm-canvas" aria-label="Live map: click anywhere to send the rover a goal"></canvas>
+  <div class="lm-status" aria-live="polite">Starting the LiDAR</div>
+  <div class="lm-readout"></div>
+</div>
+<style>
+  .lm-wrap { position: relative; width: 100%; border: 1px solid var(--rv-line, #D2D5CD); border-radius: 4px;
+    overflow: hidden; background: #CDD0C8; cursor: crosshair; touch-action: manipulation; }
+  .lm-canvas { display: block; width: 100%; height: auto; }
+  .lm-status, .lm-readout { position: absolute; font-family: 'Source Sans 3', system-ui, sans-serif;
+    font-size: 13px; line-height: 1.3; color: #161D21; background: rgba(247, 248, 244, .88);
+    padding: 5px 9px; border-radius: 3px; pointer-events: none; font-variant-numeric: tabular-nums; }
+  .lm-status { left: 10px; top: 10px; font-weight: 600; max-width: 70%; }
+  .lm-readout { right: 10px; bottom: 10px; color: #4E5A60; }
+  @media (max-width: 560px) { .lm-status, .lm-readout { font-size: 11px; padding: 3px 6px; }
+    .lm-readout { display: none; } }
+</style>
+<script>
+(function () {
+  const root = document.getElementById("lm-root");
+  if (!root || root.dataset.ready) return;
+  root.dataset.ready = "1";
+
+  // ---------- world (metres) ----------
+  const CELL = 0.1, W = 120, H = 60;               // 12 m x 6 m, 10 cm cells
+  const RANGE = 4.0;                               // LiDAR range used here (m)
+  const SCAN_HZ = 7;                               // like the A1M8 on our rover
+  const truth = new Uint8Array(W * H);             // 1 = wall or obstacle
+  const known = new Int8Array(W * H).fill(-1);     // -1 unknown, 0 free, 1 occupied
+  const idx = (cx, cy) => cy * W + cx;
+  const inside = (cx, cy) => cx >= 0 && cy >= 0 && cx < W && cy < H;
+
+  function block(x0, y0, x1, y1) {
+    for (let cy = Math.floor(y0 / CELL); cy < Math.ceil(y1 / CELL); cy++)
+      for (let cx = Math.floor(x0 / CELL); cx < Math.ceil(x1 / CELL); cx++)
+        if (inside(cx, cy)) truth[idx(cx, cy)] = 1;
+  }
+  // outer walls
+  block(0, 0, 12, 0.12); block(0, 5.88, 12, 6); block(0, 0, 0.12, 6); block(11.88, 0, 12, 6);
+  // room walls with doors
+  block(3.9, 0, 4.05, 2.2); block(3.9, 3.3, 4.05, 6);          // left room, door 2.2 - 3.3
+  block(7.95, 0, 8.1, 3.7); block(7.95, 4.8, 8.1, 6);          // right room, door 3.7 - 4.8
+  block(9.3, 2.9, 11.88, 3.05);                                 // right room half wall
+  // furniture and boxes
+  block(1.0, 0.7, 1.7, 1.25); block(2.4, 4.3, 3.2, 5.1); block(0.6, 3.6, 1.0, 4.4);
+  block(5.7, 1.4, 6.15, 1.85); block(4.9, 3.6, 6.2, 3.95); block(6.6, 4.6, 7.5, 5.2);
+  block(8.9, 0.8, 9.6, 1.5); block(10.4, 4.0, 11.2, 4.5); block(10.8, 1.0, 11.4, 1.6);
+
+  // ---------- rover ----------
+  const rover = { x: 1.6, y: 2.8, th: 0.3 };
+  const FOOT = [0.15, 0.13];                       // half length, half width (30 x 26 cm)
+  let path = [], goal = null, status = "", userGoal = false, lastActive = 0, tourIdx = 0;
+  const TOUR = [[2.6, 1.8], [5.6, 2.7], [6.8, 0.8], [9.6, 4.1], [10.8, 2.2], [6.0, 5.0], [1.8, 4.9]];
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- canvas ----------
+  const canvas = root.querySelector("canvas");
+  const ctx = canvas.getContext("2d");
+  const statusEl = root.querySelector(".lm-status");
+  const readEl = root.querySelector(".lm-readout");
+  const mapImg = document.createElement("canvas");
+  mapImg.width = W; mapImg.height = H;
+  const mctx = mapImg.getContext("2d");
+  const img = mctx.createImageData(W, H);
+  const COL = { unknown: [205, 208, 200], free: [247, 248, 244], occ: [22, 29, 33], zone: [244, 228, 231] };
+  let scale = 8, dpr = 1, portrait = false;      // scale = CSS pixels per cell
+
+  // On narrow screens the map is turned 90 degrees, so it stays large enough to tap.
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = root.clientWidth || 800;
+    portrait = w < 560;
+    scale = portrait ? w / H : w / W;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round((portrait ? W : H) * scale * dpr);
+    canvas.style.height = ((portrait ? W : H) * scale) + "px";
+  }
+  // k = device pixels per unit. Landscape: x right, y down. Portrait: the same map turned 90 degrees.
+  function view(k) {
+    if (portrait) ctx.setTransform(0, k, -k, 0, canvas.width, 0);
+    else ctx.setTransform(k, 0, 0, k, 0, 0);
+  }
+  new ResizeObserver(resize).observe(root);
+  resize();
+
+  function paintCell(i) {
+    let c = COL.unknown;
+    if (known[i] === 1) c = COL.occ;
+    else if (known[i] === 0) c = nearOcc[i] ? COL.zone : COL.free;
+    img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1]; img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = 255;
+  }
+  const nearOcc = new Uint8Array(W * H);           // safety zone around seen walls (like Nav2 inflation)
+  for (let i = 0; i < W * H; i++) paintCell(i);
+
+  // ---------- LiDAR scan ----------
+  let points = [];
+  function scan() {
+    const lx = rover.x + 0.085 * Math.cos(rover.th), ly = rover.y + 0.085 * Math.sin(rover.th);
+    const hits = [];
+    const newOcc = [];
+    for (let a = 0; a < 360; a += 1.5) {
+      const ang = rover.th + a * Math.PI / 180, dx = Math.cos(ang), dy = Math.sin(ang);
+      for (let r = 0.05; r < RANGE; r += 0.04) {
+        const px = lx + dx * r, py = ly + dy * r;
+        const cx = Math.floor(px / CELL), cy = Math.floor(py / CELL);
+        if (!inside(cx, cy)) break;
+        const i = idx(cx, cy);
+        if (truth[i]) {
+          if (known[i] !== 1) { known[i] = 1; newOcc.push([cx, cy]); paintCell(i); }
+          const n = (Math.random() - 0.5) * 0.03;
+          hits.push([px + dx * n, py + dy * n]);
+          break;
+        }
+        if (known[i] === -1) { known[i] = 0; paintCell(i); }
+      }
+    }
+    for (const [cx, cy] of newOcc)                   // grow the safety zone around new walls
+      for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+        const nx = cx + ox, ny = cy + oy;
+        if (inside(nx, ny) && ox * ox + oy * oy <= 5) { const j = idx(nx, ny); nearOcc[j] = 1; paintCell(j); }
+      }
+    mctx.putImageData(img, 0, 0);
+    points = hits;
+    return newOcc.length > 0;
+  }
+
+  // ---------- planner (A* on the grid, like Nav2's global planner) ----------
+  function blockedGrid() {
+    const b = new Uint8Array(W * H);
+    for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
+      if (known[idx(cx, cy)] !== 1) continue;
+      for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+        const nx = cx + ox, ny = cy + oy;
+        if (inside(nx, ny) && ox * ox + oy * oy <= 5) b[idx(nx, ny)] = 1;
+      }
+    }
+    return b;
+  }
+  function plan(gx, gy) {
+    const b = blockedGrid();
+    const sx = Math.floor(rover.x / CELL), sy = Math.floor(rover.y / CELL);
+    const tx = Math.floor(gx / CELL), ty = Math.floor(gy / CELL);
+    if (!inside(tx, ty) || b[idx(tx, ty)]) return null;
+    b[idx(sx, sy)] = 0;
+    const g = new Float32Array(W * H).fill(Infinity), from = new Int32Array(W * H).fill(-1);
+    const heap = [];
+    const push = (i, f) => { heap.push([f, i]); let k = heap.length - 1;
+      while (k > 0) { const p = (k - 1) >> 1; if (heap[p][0] <= heap[k][0]) break; [heap[p], heap[k]] = [heap[k], heap[p]]; k = p; } };
+    const pop = () => { const top = heap[0], last = heap.pop();
+      if (heap.length) { heap[0] = last; let k = 0;
+        for (;;) { const l = 2 * k + 1, r = l + 1; let m = k;
+          if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+          if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+          if (m === k) break; [heap[m], heap[k]] = [heap[k], heap[m]]; k = m; } }
+      return top; };
+    const hfn = (cx, cy) => { const dx = Math.abs(cx - tx), dy = Math.abs(cy - ty); return Math.max(dx, dy) + 0.414 * Math.min(dx, dy); };
+    const start = idx(sx, sy), target = idx(tx, ty);
+    g[start] = 0; push(start, hfn(sx, sy));
+    const D = [[1,0,1],[-1,0,1],[0,1,1],[0,-1,1],[1,1,1.414],[1,-1,1.414],[-1,1,1.414],[-1,-1,1.414]];
+    let steps = 0;
+    while (heap.length && steps++ < 60000) {
+      const [, cur] = pop();
+      if (cur === target) break;
+      const cx = cur % W, cy = (cur / W) | 0;
+      for (const [ox, oy, c] of D) {
+        const nx = cx + ox, ny = cy + oy;
+        if (!inside(nx, ny)) continue;
+        const j = idx(nx, ny);
+        if (b[j]) continue;
+        const k = known[j];
+        const cost = c * (k === -1 ? 1.6 : 1) + (nearOcc[j] ? 0.8 : 0);   // prefer seen, open space
+        const ng = g[cur] + cost;
+        if (ng < g[j]) { g[j] = ng; from[j] = cur; push(j, ng + hfn(nx, ny)); }
+      }
+    }
+    if (from[target] === -1 && target !== start) return null;
+    const out = [];
+    for (let c = target; c !== -1; c = from[c]) out.push([(c % W + 0.5) * CELL, (((c / W) | 0) + 0.5) * CELL]);
+    out.reverse();
+    return out;
+  }
+
+  function setGoal(x, y, byUser) {
+    goal = { x, y, th: Math.atan2(y - rover.y, x - rover.x) };
+    userGoal = byUser;
+    const p = plan(x, y);
+    if (!p) { path = []; status = byUser ? "That spot is inside an obstacle. Pick a free spot." : ""; goal = byUser ? null : goal; return; }
+    path = p;
+    status = byUser ? "Goal received. Driving there" : "Exploring on its own. Click the map to send a goal";
+  }
+
+  // ---------- controller (follows the path, turns on the spot when the turn is sharp) ----------
+  function control(dt) {
+    if (!goal || !path.length) return;
+    const dist = Math.hypot(goal.x - rover.x, goal.y - rover.y);
+    if (dist < 0.15) {
+      status = userGoal ? "Goal reached. Click again" : "Exploring on its own. Click the map to send a goal";
+      path = []; goal = null; lastActive = performance.now(); return;
+    }
+    while (path.length > 1 && Math.hypot(path[0][0] - rover.x, path[0][1] - rover.y) < 0.35) path.shift();
+    let tgt = path[0];
+    for (const p of path) { if (Math.hypot(p[0] - rover.x, p[1] - rover.y) > 0.45) { tgt = p; break; } tgt = p; }
+    let err = Math.atan2(tgt[1] - rover.y, tgt[0] - rover.x) - rover.th;
+    err = Math.atan2(Math.sin(err), Math.cos(err));
+    let v = 0, w = Math.max(-2.2, Math.min(2.2, 3.0 * err));
+    if (Math.abs(err) < 0.9) v = 0.75 * (1 - Math.abs(err) / 1.1);
+    const nx = rover.x + v * Math.cos(rover.th) * dt, ny = rover.y + v * Math.sin(rover.th) * dt;
+    const cx = Math.floor(nx / CELL), cy = Math.floor(ny / CELL);
+    if (inside(cx, cy) && !truth[idx(cx, cy)]) { rover.x = nx; rover.y = ny; }
+    rover.th += w * dt;
+  }
+
+  // ---------- drawing ----------
+  let beam = 0;
+  function draw() {
+    const k = scale * dpr, s = k / CELL;               // device pixels per cell, per metre
+    ctx.imageSmoothingEnabled = false;
+    view(k);
+    ctx.drawImage(mapImg, 0, 0);
+    view(s);                                           // from here on, units are metres
+
+    ctx.strokeStyle = "rgba(22,29,33,0.06)"; ctx.lineWidth = 1 / s;   // 1 m grid
+    ctx.beginPath();
+    for (let x = 1; x < 12; x++) { ctx.moveTo(x, 0); ctx.lineTo(x, 6); }
+    for (let y = 1; y < 6; y++) { ctx.moveTo(0, y); ctx.lineTo(12, y); }
+    ctx.stroke();
+
+    if (path.length) {                                 // planned path (green, like Nav2)
+      ctx.strokeStyle = "#1E8F55"; ctx.lineWidth = 0.045; ctx.lineJoin = "round"; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(rover.x, rover.y);
+      for (const p of path) ctx.lineTo(p[0], p[1]);
+      ctx.stroke();
+    }
+    if (goal) {                                        // goal arrow
+      ctx.save(); ctx.translate(goal.x, goal.y); ctx.rotate(goal.th);
+      ctx.fillStyle = "#1E8F55";
+      ctx.beginPath(); ctx.moveTo(0.22, 0); ctx.lineTo(-0.08, 0.1); ctx.lineTo(-0.02, 0); ctx.lineTo(-0.08, -0.1); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    const lx = rover.x + 0.085 * Math.cos(rover.th), ly = rover.y + 0.085 * Math.sin(rover.th);
+    const ba = reduce ? rover.th : beam;               // rotating beam
+    const grad = ctx.createRadialGradient(lx, ly, 0, lx, ly, RANGE);
+    grad.addColorStop(0, "rgba(211,38,62,0.22)"); grad.addColorStop(1, "rgba(211,38,62,0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.moveTo(lx, ly); ctx.arc(lx, ly, RANGE, ba - 0.5, ba); ctx.closePath(); ctx.fill();
+
+    ctx.fillStyle = "#D3263E";                         // LiDAR points
+    for (const [px, py] of points) { ctx.beginPath(); ctx.arc(px, py, 0.028, 0, 6.283); ctx.fill(); }
+
+    ctx.save(); ctx.translate(rover.x, rover.y); ctx.rotate(rover.th);   // the rover, real size
+    ctx.fillStyle = "#161D21";
+    ctx.fillRect(-FOOT[0], -FOOT[1], FOOT[0] * 2, FOOT[1] * 2);
+    ctx.fillStyle = "#F7F8F4"; ctx.fillRect(0.05, -0.03, 0.09, 0.06);
+    ctx.fillStyle = "#D3263E"; ctx.beginPath(); ctx.arc(0.085, 0, 0.045, 0, 6.283); ctx.fill();
+    ctx.restore();
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);            // scale bar, in screen pixels
+    const m = scale / CELL, bx = 14, by = canvas.height / dpr - 14;
+    ctx.fillStyle = "#161D21";
+    ctx.fillRect(bx, by, m, 2); ctx.fillRect(bx, by - 5, 2, 9); ctx.fillRect(bx + m - 2, by - 5, 2, 9);
+    ctx.font = "600 12px 'Source Sans 3', sans-serif"; ctx.fillText("1 m", bx + m / 2 - 9, by - 7);
+  }
+
+  function mapped() {
+    let k = 0, t = 0;
+    for (let i = 0; i < W * H; i++) if (!truth[i]) { t++; if (known[i] !== -1) k++; }
+    return Math.round(100 * k / t);
+  }
+
+  // ---------- input ----------
+  root.addEventListener("click", (e) => {
+    const r = canvas.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const x = portrait ? py / r.height * 12 : px / r.width * 12;
+    const y = portrait ? 6 - px / r.width * 6 : py / r.height * 6;
+    setGoal(x, y, true);
+    lastActive = performance.now();
+  });
+
+  // ---------- loop ----------
+  let last = performance.now(), scanAcc = 0, planAcc = 0, readAcc = 0, visible = true;
+  new IntersectionObserver((es) => { visible = es[0].isIntersecting; }).observe(root);
+  scan(); status = reduce ? "Click the map to send the rover a goal" : "Exploring on its own. Click the map to send a goal";
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (visible) {
+      beam += dt * 2 * Math.PI * 1.1;
+      scanAcc += dt; planAcc += dt; readAcc += dt;
+      if (scanAcc > 1 / SCAN_HZ) { scanAcc = 0; scan(); }
+      if (goal && planAcc > 0.5) {                      // replan as the map grows
+        planAcc = 0;
+        const p = plan(goal.x, goal.y);
+        if (p) path = p;
+        else if (userGoal) { status = "No path to that goal now. Try another spot"; goal = null; path = []; }
+        else { goal = null; path = []; }
+      }
+      if (!goal && !reduce && now - lastActive > (userGoal ? 6000 : 1200)) {
+        const t = TOUR[tourIdx++ % TOUR.length];
+        setGoal(t[0], t[1], false);
+        lastActive = now;
+      }
+      control(dt);
+      draw();
+      statusEl.textContent = status;
+      if (readAcc > 0.25) {
+        readAcc = 0;
+        const deg = ((rover.th * 180 / Math.PI) % 360 + 360) % 360;
+        readEl.textContent = `x ${rover.x.toFixed(2)} m   y ${rover.y.toFixed(2)} m   heading ${deg.toFixed(0)}°   seen ${mapped()}%`;
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
