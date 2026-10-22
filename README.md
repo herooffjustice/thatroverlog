@@ -54,7 +54,13 @@ Use real photos only. Resize each to about 1600 px wide first, so the page loads
 - **Rover photos** (the "The rover" section): put them in `static/photos/`. They appear in name order, and the first one is shown large. The part after the first `_` becomes the caption, so `1_front-view.jpg` shows "front view". 3, 5 or 7 photos fill the layout best.
 - **Workflow photos:** put them in `static/workflow/`, then open `data/log.csv` and write the file name in the `photos` column of that item, and a short caption in the `captions` column. For more than one photo, separate the names (and the captions, in the same order) with `;`, for example `cable-soldering.jpg; cable-test.jpg`. The photos appear next to that item, and clicking one opens it full size.
 - **Videos:** upload to YouTube as *Unlisted* and paste the links in `site.toml` under `[[videos]]`.
-- **Text:** all home page text is in `site.toml`. The workflow is in `data/log.csv` (open it in Excel). Keep the `no` column in order. After changing the workflow or notes, the assistant re-reads them on the next start.
+- **Text:** all home page text is in `site.toml`. The workflow is in `data/log.csv` (open it in Excel). Keep the `no` column in order.
+- **After changing anything in `data/`** (notes, workflow, datasheets), rebuild the search index on your laptop and upload it with the change:
+  ```
+  python rag.py
+  git add . && git commit -m "update data" && git push
+  ```
+  The `index/` folder holds the finished index. The free Streamlit server has about 1 GB of memory, which is not enough to read all the PDFs itself, so it only loads this folder (about 230 MB of memory instead of about 760 MB).
 
 ## Put it online (Streamlit Community Cloud, free)
 

@@ -20,7 +20,6 @@ import csv
 import hashlib
 import json
 import os
-import pickle
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +28,8 @@ import numpy as np
 
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
-INDEX_DIR = ROOT / ".index"
+INDEX_DIR = ROOT / "index"       # the finished search index, built once and uploaded with the app
+INDEX_VERSION = "4"               # raise this when the chunking code changes, then run: python rag.py
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MIN_SIMILARITY = 0.25   # below this, we answer "I don't know" without calling the LLM
@@ -153,6 +153,10 @@ def load_pdf(path: Path) -> list[Chunk]:
                                         f"page {page_no}", part, page_no, {"kind": "table"}))
             # b) normal text -> overlapping windows of about 140 words
             text = _clean(page.extract_text() or "")
+            try:
+                page.close()                           # free this page's memory before the next one
+            except Exception:
+                pass
             words = text.split()
             if len(words) < 12:
                 continue
@@ -219,12 +223,13 @@ def detect_parts(question: str) -> list[str]:
 
 
 def _data_fingerprint(data_dir: Path) -> str:
-    h = hashlib.md5()
+    """A short code that changes whenever any data file's content changes.
+    It uses file contents (not dates), so the same files give the same code on any computer."""
+    h = hashlib.md5(f"{INDEX_VERSION}|{EMBED_MODEL}".encode())
     for p in sorted(data_dir.rglob("*")):
         if p.is_file():
-            h.update(f"{p.relative_to(data_dir)}:{p.stat().st_size}:{int(p.stat().st_mtime)}".encode())
-    h.update(EMBED_MODEL.encode())
-    h.update(Path(__file__).read_bytes())   # rebuild when this file (the chunking code) changes
+            h.update(str(p.relative_to(data_dir)).replace("\\", "/").encode())
+            h.update(hashlib.md5(p.read_bytes()).digest())
     return h.hexdigest()[:12]
 
 
@@ -236,20 +241,26 @@ class RoverIndex:
         from fastembed import TextEmbedding
         from rank_bm25 import BM25Okapi
 
-        self.embedder = TextEmbedding(EMBED_MODEL)
-        cache = INDEX_DIR / f"index_{_data_fingerprint(data_dir)}.pkl"
-        if cache.exists():
-            with cache.open("rb") as f:
-                rows, vectors = pickle.load(f)
-            self.chunks = [Chunk(**r) for r in rows]
+        # threads=1 keeps memory low on small servers (Streamlit Cloud gives about 1 GB).
+        self.embedder = TextEmbedding(EMBED_MODEL, threads=1)
+        fingerprint = _data_fingerprint(data_dir)
+        chunks_file, vectors_file = INDEX_DIR / "chunks.json", INDEX_DIR / "vectors.npy"
+        saved = json.loads(chunks_file.read_text(encoding="utf-8")) if chunks_file.exists() else {}
+        if saved.get("fingerprint") == fingerprint and vectors_file.exists():
+            # Fast and light: load the finished index instead of reading the PDFs again.
+            self.chunks = [Chunk(**r) for r in saved["chunks"]]
+            vectors = np.load(vectors_file)
         else:
+            # Heavy: read every PDF and note, then embed every piece. Done once, then saved.
             self.chunks = load_all(data_dir)
             vectors = self._embed([c.text for c in self.chunks])
-            INDEX_DIR.mkdir(exist_ok=True)
-            for old in INDEX_DIR.glob("index_*.pkl"):
-                old.unlink()
-            with cache.open("wb") as f:
-                pickle.dump(([vars(c) for c in self.chunks], vectors), f)   # plain dicts: safe to reload
+            try:
+                INDEX_DIR.mkdir(exist_ok=True)
+                chunks_file.write_text(json.dumps({"fingerprint": fingerprint,
+                                                   "chunks": [vars(c) for c in self.chunks]}), encoding="utf-8")
+                np.save(vectors_file, vectors)
+            except OSError:
+                pass                                   # read-only server: just keep it in memory
 
         self.vectors = vectors
         self.faiss = faiss.IndexFlatIP(vectors.shape[1])   # inner product = cosine (vectors are normalised)
@@ -257,7 +268,7 @@ class RoverIndex:
         self.bm25 = BM25Okapi([tokenize(c.text) for c in self.chunks])
 
     def _embed(self, texts: list[str]) -> np.ndarray:
-        v = np.array(list(self.embedder.embed(texts)), dtype="float32")
+        v = np.array(list(self.embedder.embed(texts, batch_size=32)), dtype="float32")
         return v / np.linalg.norm(v, axis=1, keepdims=True)
 
     def stats(self) -> dict:
