@@ -1,5 +1,10 @@
 """
-rag.py - the question-answering engine behind "Ask the Rover".
+rag.py - the question-answering engine behind "Ask the Rover" and "WasteVision".
+
+The same engine serves two knowledge bases that never mix: each has its own data folder,
+its own prebuilt index, its own document names and its own instruction for the AI.
+  ROVER: data/        -> index/        (our rover notes, workflow and part datasheets)
+  WASTE: data_waste/  -> index_waste/  (India's waste management rules)
 
 Pipeline (the same 4 steps as the Hack Hour poster):
   1. Ingest   - read datasheet PDFs, our notes (.md) and the activity log (.csv),
@@ -11,7 +16,7 @@ Pipeline (the same 4 steps as the Hack Hour poster):
   4. Cite     - every answer shows its sources, and a "number check" confirms
                 each number in the answer really appears in a cited source.
 
-Run `python rag.py` to build the index and try a few questions in the terminal.
+Run `python rag.py` to build both indexes and try a few questions in the terminal.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ MIN_SIMILARITY = 0.25   # below this, we answer "I don't know" without calling t
 TOP_K = 6               # how many chunks the LLM gets
 DENSE_WEIGHT = 0.7      # hybrid score = meaning score x weight + keyword score x (1 - weight)
 NOT_FOUND = "I don't know. Our notes and datasheets do not have this information."
+NOT_FOUND_WASTE = "I don't know. The waste rules we have do not cover this."
 
 # Each part, the words people use for it, and a word that appears in its PDF file name.
 PARTS = {
@@ -44,6 +50,35 @@ PARTS = {
     "RPLiDAR A1M8": {"file": "rplidar", "names": ["rplidar", "a1m8", "lidar"]},
     "Raspberry Pi 5": {"file": "raspberry", "names": ["raspberry pi", "pi 5", "pi5", "raspberry"]},
 }
+
+# The waste rules. "names" are only the full rule names, so a question about "plastic" still
+# searches every rule (the SWM Rules talk about plastic too). Only "the plastic waste rules" filters.
+RULES = {
+    "Solid Waste Management Rules 2016": {"file": "solid_waste",
+        "names": ["solid waste management rules", "swm rules", "swm rules 2016"]},
+    "Plastic Waste Management Rules 2016 (as amended)": {"file": "plastic_waste",
+        "names": ["plastic waste management rules", "plastic waste rules", "pwm rules"]},
+    "E-Waste (Management) Rules 2022": {"file": "e-waste",
+        "names": ["e-waste rules", "e-waste management rules", "ewaste rules"]},
+}
+
+
+@dataclass
+class KnowledgeBase:
+    """Everything that makes one knowledge base separate from the other."""
+    name: str
+    data_dir: Path
+    index_dir: Path
+    pdf_folder: str            # sub-folder with the PDFs
+    pdf_kind: str              # "datasheet" or "rules" (decides how sources are labelled)
+    parts: dict                # document names, used for the label and the "named document" filter
+    system_prompt: str
+    not_found: str
+    english_only: bool = False # skip non-English text (the rules are bilingual Hindi + English gazettes)
+    tables: bool = True        # turn PDF tables into sentences (useful for datasheets, noise for gazettes)
+    chunk_words: int = 140     # words per piece of PDF text
+    chunk_overlap: int = 30    # words shared by neighbouring pieces, so no sentence is cut off completely
+    legal: bool = False        # split at clause boundaries (definitions, sub-rules) instead of fixed windows
 
 
 @dataclass
@@ -60,6 +95,8 @@ class Chunk:
     def label(self) -> str:
         if self.source_type == "datasheet":
             return f"{self.part} datasheet, {self.location}"
+        if self.source_type == "rules":
+            return f"{self.part}, {self.location}"
         if self.source_type == "log":
             return f"Our workflow, {self.location}"
         return f"Our notes: {self.source}, {self.location}"
@@ -85,9 +122,35 @@ def _windows(words: list[str], size: int = 140, overlap: int = 30):
         yield " ".join(words[start:start + size])
 
 
-def _part_for_file(name: str) -> str:
+# Where a new clause starts in legal text: a numbered definition (14. "domestic ...),
+# a sub-rule like (1) or (a), or a numbered rule heading (4 Duties of ...).
+CLAUSE_RE = re.compile(r'(?=\s(?:\d{1,3}\.\s*[“"\'‘]|\(\w{1,4}\)\s|\d{1,2}\.?\s+[A-Z][a-z]+(?:\s[a-z]+){0,4}\s?[.\-–—]))')
+
+
+def _clause_pieces(text: str, size: int) -> list[str]:
+    """Split legal text at clause boundaries, then join neighbouring clauses up to `size` words.
+    A definition like "domestic hazardous waste means ..." then stays in one small piece,
+    instead of being buried in a long window of other definitions."""
+    pieces, cur = [], []
+    for clause in CLAUSE_RE.split(text):
+        words = clause.split()
+        if not words:
+            continue
+        if cur and len(cur) + len(words) > size:
+            pieces.append(" ".join(cur))
+            cur = []
+        while len(words) > size:                       # a very long clause: cut it into windows
+            pieces.append(" ".join(words[:size]))
+            words = words[size - 20:]
+        cur += words
+    if cur:
+        pieces.append(" ".join(cur))
+    return pieces
+
+
+def _part_for_file(name: str, parts: dict | None = None) -> str:
     low = name.lower()
-    for part, info in PARTS.items():
+    for part, info in (PARTS if parts is None else parts).items():
         if info["file"] in low:
             return part
     return Path(name).stem
@@ -134,23 +197,39 @@ def _table_to_sentences(table: list[list], part: str, page: int) -> list[str]:
     return sentences
 
 
-def load_pdf(path: Path) -> list[Chunk]:
+ENGLISH_WORDS = set("the of and to in a be by or for shall any such as with on from is under this that "
+                    "which not other at an waste its their are all rule rules local body may".split())
+
+
+def _is_english(text: str) -> bool:
+    """True if a piece of text reads as English. The rules PDFs are Hindi + English gazettes, and
+    the Hindi part often comes out as Latin-looking letters, so we count common English words."""
+    words = re.findall(r"[a-z]+", text.lower())
+    return len(words) >= 8 and sum(w in ENGLISH_WORDS for w in words) / len(words) >= 0.12
+
+
+def load_pdf(path: Path, parts: dict | None = None, kind: str = "datasheet",
+             english_only: bool = False, tables_on: bool = True, chunk_words: int = 140,
+             chunk_overlap: int = 30, legal: bool = False) -> list[Chunk]:
     import pdfplumber
 
-    part = _part_for_file(path.name)
+    part = _part_for_file(path.name, parts)
+    keep = _is_english if english_only else (lambda t: True)
     chunks = []
     with pdfplumber.open(path) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
             # a) tables -> one sentence per row, grouped 6 rows per chunk
             try:
-                tables = page.extract_tables()
+                tables = page.extract_tables() if tables_on else []
             except Exception:
                 tables = []
             for table in tables:
                 rows = _table_to_sentences(table, part, page_no)
                 for i in range(0, len(rows), 6):
-                    chunks.append(Chunk(" ".join(rows[i:i + 6]), "datasheet", path.name,
-                                        f"page {page_no}", part, page_no, {"kind": "table"}))
+                    text = " ".join(rows[i:i + 6])
+                    if keep(text):
+                        chunks.append(Chunk(text, kind, path.name, f"page {page_no}", part, page_no,
+                                            {"kind": "table"}))
             # b) normal text -> overlapping windows of about 140 words
             text = _clean(page.extract_text() or "")
             try:
@@ -160,9 +239,12 @@ def load_pdf(path: Path) -> list[Chunk]:
             words = text.split()
             if len(words) < 12:
                 continue
-            for piece in _windows(words):
-                chunks.append(Chunk(f"{part} (page {page_no}): {piece}", "datasheet", path.name,
-                                    f"page {page_no}", part, page_no, {"kind": "text"}))
+            pieces = (_clause_pieces(" ".join(words), chunk_words) if legal
+                      else _windows(words, size=chunk_words, overlap=chunk_overlap))
+            for piece in pieces:
+                if keep(piece):
+                    chunks.append(Chunk(f"{part} (page {page_no}): {piece}", kind, path.name,
+                                        f"page {page_no}", part, page_no, {"kind": "text"}))
     return chunks
 
 
@@ -194,10 +276,12 @@ def load_log(path: Path) -> list[Chunk]:
     return chunks
 
 
-def load_all(data_dir: Path = DATA) -> list[Chunk]:
+def load_all(kb: "KnowledgeBase") -> list[Chunk]:
+    data_dir = kb.data_dir
     chunks: list[Chunk] = []
-    for pdf in sorted((data_dir / "datasheets").glob("*.pdf")):
-        chunks += load_pdf(pdf)
+    for pdf in sorted((data_dir / kb.pdf_folder).glob("*.pdf")):
+        chunks += load_pdf(pdf, kb.parts, kb.pdf_kind, kb.english_only, kb.tables, kb.chunk_words,
+                           kb.chunk_overlap, kb.legal)
     for md in sorted((data_dir / "notes").glob("*.md")):
         chunks += load_notes(md)
     if (data_dir / "log.csv").exists():
@@ -216,16 +300,16 @@ def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text.lower())
 
 
-def detect_parts(question: str) -> list[str]:
+def detect_parts(question: str, parts: dict | None = None) -> list[str]:
     q = question.lower()
-    return [part for part, info in PARTS.items()
+    return [part for part, info in (PARTS if parts is None else parts).items()
             if any(re.search(rf"\b{re.escape(n)}\b", q) for n in info["names"])]
 
 
-def _data_fingerprint(data_dir: Path) -> str:
-    """A short code that changes whenever any data file's content changes.
+def _data_fingerprint(data_dir: Path, settings: str = "") -> str:
+    """A short code that changes whenever any data file's content (or the chunking settings) change.
     It uses file contents (not dates), so the same files give the same code on any computer."""
-    h = hashlib.md5(f"{INDEX_VERSION}|{EMBED_MODEL}".encode())
+    h = hashlib.md5(f"{INDEX_VERSION}|{EMBED_MODEL}|{settings}".encode())
     for p in sorted(data_dir.rglob("*")):
         if p.is_file():
             h.update(str(p.relative_to(data_dir)).replace("\\", "/").encode())
@@ -233,18 +317,17 @@ def _data_fingerprint(data_dir: Path) -> str:
     return h.hexdigest()[:12]
 
 
-class RoverIndex:
-    """Holds all chunks, the BM25 index and the embedding (FAISS) index."""
+class KnowledgeIndex:
+    """Holds one knowledge base's chunks, its BM25 index and its embedding (FAISS) index."""
 
-    def __init__(self, data_dir: Path = DATA):
+    def __init__(self, kb: "KnowledgeBase"):
         import faiss
-        from fastembed import TextEmbedding
         from rank_bm25 import BM25Okapi
 
-        # threads=1 keeps memory low on small servers (Streamlit Cloud gives about 1 GB).
-        self.embedder = TextEmbedding(EMBED_MODEL, threads=1)
-        fingerprint = _data_fingerprint(data_dir)
-        chunks_file, vectors_file = INDEX_DIR / "chunks.json", INDEX_DIR / "vectors.npy"
+        self.kb = kb
+        self.embedder = _embedder()
+        fingerprint = _data_fingerprint(kb.data_dir, f"{kb.english_only}|{kb.tables}|{kb.chunk_words}|{kb.chunk_overlap}|{kb.legal}")
+        chunks_file, vectors_file = kb.index_dir / "chunks.json", kb.index_dir / "vectors.npy"
         saved = json.loads(chunks_file.read_text(encoding="utf-8")) if chunks_file.exists() else {}
         if saved.get("fingerprint") == fingerprint and vectors_file.exists():
             # Fast and light: load the finished index instead of reading the PDFs again.
@@ -252,10 +335,10 @@ class RoverIndex:
             vectors = np.load(vectors_file)
         else:
             # Heavy: read every PDF and note, then embed every piece. Done once, then saved.
-            self.chunks = load_all(data_dir)
+            self.chunks = load_all(kb)
             vectors = self._embed([c.text for c in self.chunks])
             try:
-                INDEX_DIR.mkdir(exist_ok=True)
+                kb.index_dir.mkdir(exist_ok=True)
                 chunks_file.write_text(json.dumps({"fingerprint": fingerprint,
                                                    "chunks": [vars(c) for c in self.chunks]}), encoding="utf-8")
                 np.save(vectors_file, vectors)
@@ -273,7 +356,7 @@ class RoverIndex:
 
     def stats(self) -> dict:
         out = {"chunks": len(self.chunks)}
-        for t in ("datasheet", "notes", "log"):
+        for t in ("datasheet", "rules", "notes", "log"):
             out[t] = sum(1 for c in self.chunks if c.source_type == t)
         out["table_rows"] = sum(1 for c in self.chunks if c.meta.get("kind") == "table")
         return out
@@ -283,11 +366,11 @@ class RoverIndex:
 
         mode: "hybrid" (default), "bm25" or "dense" - useful for comparing methods.
         """
-        parts = detect_parts(question)
-        # Part filter: if the question names a part, ignore the OTHER parts' datasheets.
+        parts = detect_parts(question, self.kb.parts)
+        # Part filter: if the question names a part (or a rule), ignore the OTHER PDFs.
         # Our notes and the log stay in, because they talk about the whole rover.
         allowed = np.array([
-            not (c.source_type == "datasheet" and parts and c.part not in parts)
+            not (c.source_type == self.kb.pdf_kind and parts and c.part not in parts)
             for c in self.chunks
         ])
 
@@ -318,6 +401,18 @@ class RoverIndex:
         return top, info
 
 
+_EMBEDDER: list = []
+
+
+def _embedder():
+    """One copy of the embedding model, shared by both knowledge bases (saves memory)."""
+    if not _EMBEDDER:
+        from fastembed import TextEmbedding
+        # threads=1 keeps memory low on small servers (Streamlit Cloud gives about 1 GB).
+        _EMBEDDER.append(TextEmbedding(EMBED_MODEL, threads=1))
+    return _EMBEDDER[0]
+
+
 # --------------------------------------------------------------------------------------
 # 3. GENERATE
 # --------------------------------------------------------------------------------------
@@ -332,6 +427,39 @@ SYSTEM_PROMPT = (
     f"If the sources do not contain the answer, reply exactly: {NOT_FOUND} "
     "Keep the answer short and in simple English."
 )
+
+
+SYSTEM_PROMPT_WASTE = (
+    "You answer questions about how households in India should segregate and dispose of waste. "
+    "Use ONLY the numbered sources given, which are extracts from India's waste management rules. "
+    "Do not use outside knowledge. "
+    "Cite the sources you use like [1] or [2][3] right after each fact. Use only this plain [n] form for citations. "
+    "Copy numbers, rule numbers and terms exactly as the sources write them. "
+    "Say what the person should do, in short practical steps. Every step must end with its citation. "
+    "You may combine facts from different sources, for example a definition in one source (which stream "
+    "an item belongs to) and a duty in another (what to do with that stream). "
+    "Do not add any step, example or advice that the sources do not state. "
+    "If the sources only partly answer the question, answer that part and then say what they do not cover. "
+    f"If the sources do not contain the answer, reply exactly: {NOT_FOUND_WASTE} "
+    "Keep the answer short and in simple English."
+)
+
+ROVER = KnowledgeBase("Rover", DATA, INDEX_DIR, "datasheets", "datasheet", PARTS, SYSTEM_PROMPT, NOT_FOUND)
+WASTE = KnowledgeBase("Waste rules", ROOT / "data_waste", ROOT / "index_waste", "rules", "rules", RULES,
+                      SYSTEM_PROMPT_WASTE, NOT_FOUND_WASTE, english_only=True, tables=False, chunk_words=60,
+                      chunk_overlap=25, legal=True)
+
+
+class RoverIndex(KnowledgeIndex):
+    """The rover knowledge base (kept as its own name so older code keeps working)."""
+
+    def __init__(self, kb: KnowledgeBase = ROVER):
+        super().__init__(kb)
+
+
+class WasteIndex(KnowledgeIndex):
+    def __init__(self, kb: KnowledgeBase = WASTE):
+        super().__init__(kb)
 
 
 def build_prompt(question: str, hits: list[tuple[Chunk, float]]) -> str:
@@ -399,7 +527,7 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
-def call_llm(question: str, hits: list[tuple[Chunk, float]]) -> str:
+def call_llm(question: str, hits: list[tuple[Chunk, float]], system_prompt: str = SYSTEM_PROMPT) -> str:
     import requests
 
     prompt = build_prompt(question, hits)
@@ -409,7 +537,7 @@ def call_llm(question: str, hits: list[tuple[Chunk, float]]) -> str:
         model = _secret("GROQ_MODEL") or _pick_groq_model(key)
         for attempt in range(2):
             body = {"model": model, "temperature": 0,
-                    "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                    "messages": [{"role": "system", "content": system_prompt},
                                  {"role": "user", "content": prompt}]}
             if model.startswith("openai/gpt-oss"):
                 body["reasoning_effort"] = "low"       # faster answers; the task is simple
@@ -428,7 +556,7 @@ def call_llm(question: str, hits: list[tuple[Chunk, float]]) -> str:
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={"x-goog-api-key": _secret("GEMINI_API_KEY")},
             json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0},
             },
@@ -475,6 +603,7 @@ def _numbers(text: str) -> set[str]:
     text = re.sub(r"[\u00a0\u2000-\u200b\u202f\u205f\u3000]", " ", text)   # all kinds of spaces -> " "
     text = PART_NAME_RE.sub(" ", text)
     text = re.sub(r"\[\d+\]", " ", text)                    # drop citation markers like [2]
+    text = re.sub(r"(?m)^\s*(?:[-*]\s*)?\d{1,2}[.)]\s", " ", text)   # drop list numbers like "1. " at line start
     found = set()
     for h in HEX_RE.findall(text):
         found.add(h.lower())
@@ -493,7 +622,7 @@ def cited_ids(answer: str, n_hits: int) -> list[int]:
 
 def number_check(answer: str, hits: list[tuple[Chunk, float]]) -> dict:
     """Check that every number in the answer appears in the sources it cites."""
-    if NOT_FOUND[:12].lower() in answer.lower():
+    if answer.lower().startswith("i don't know"):
         return {"status": "refused", "missing": []}
     ids = cited_ids(answer, len(hits)) or list(range(1, len(hits) + 1))
     source_numbers: set[str] = set()
@@ -506,14 +635,15 @@ def number_check(answer: str, hits: list[tuple[Chunk, float]]) -> dict:
     return {"status": "verified" if not missing else "unverified", "missing": missing}
 
 
-def answer(index: RoverIndex, question: str) -> dict:
+def answer(index: KnowledgeIndex, question: str) -> dict:
     """Full pipeline for one question. Returns everything the UI needs."""
+    kb = index.kb
     hits, info = index.search(question)
     result = {"question": question, "hits": hits, "info": info, "cited": [], "llm": llm_provider()}
 
     # Early "I don't know": nothing in the data is close enough to the question.
     if info["best_similarity"] < MIN_SIMILARITY:
-        result.update(answer=NOT_FOUND, check={"status": "refused", "missing": []}, gate="low_score")
+        result.update(answer=kb.not_found, check={"status": "refused", "missing": []}, gate="low_score")
         return result
 
     if result["llm"] is None:
@@ -523,7 +653,7 @@ def answer(index: RoverIndex, question: str) -> dict:
                       check={"status": "no_llm", "missing": []}, cited=[1, 2], gate="no_llm")
         return result
 
-    text = call_llm(question, hits)
+    text = call_llm(question, hits, kb.system_prompt)
     result.update(answer=text, check=number_check(text, hits), cited=cited_ids(text, len(hits)), gate="llm")
     return result
 
@@ -532,10 +662,12 @@ def answer(index: RoverIndex, question: str) -> dict:
 # Page image with highlights (for showing the real datasheet page next to the answer)
 # --------------------------------------------------------------------------------------
 
-def page_image(pdf_name: str, page: int, highlight: list[str], zoom: float = 1.6) -> bytes:
+def page_image(pdf_name: str, page: int, highlight: list[str], zoom: float = 1.6,
+               kb: KnowledgeBase | None = None) -> bytes:
     import pymupdf
 
-    doc = pymupdf.open(DATA / "datasheets" / pdf_name)
+    kb = kb or ROVER
+    doc = pymupdf.open(kb.data_dir / kb.pdf_folder / pdf_name)
     pg = doc[page - 1]
     for term in highlight:
         for rect in pg.search_for(term)[:6]:
@@ -555,12 +687,19 @@ def highlight_terms(answer_text: str) -> list[str]:
 
 
 if __name__ == "__main__":
-    idx = RoverIndex()
-    print(json.dumps(idx.stats(), indent=2))
-    for q in ["What is the maximum output current per channel of the TB6612FNG?",
-              "Why does the LiDAR disconnect during turns?",
-              "What is the rover's top speed on grass?"]:
-        hits, info = idx.search(q)
-        print("\nQ:", q, "| parts:", info["parts"], "| best sim: %.2f" % info["best_similarity"])
-        for c, s in hits[:3]:
-            print(f"   {s:.2f}  {c.label}: {c.text[:110]}")
+    tests = {
+        "rover": (RoverIndex, ["What is the maximum output current per channel of the TB6612FNG?",
+                               "Why does the LiDAR disconnect during turns?",
+                               "What is the rover's top speed on grass?"]),
+        "waste": (WasteIndex, ["How should a household segregate its waste?",
+                               "What should I do with used batteries and expired medicines?",
+                               "What is the rover's top speed?"]),
+    }
+    for name, (make, questions) in tests.items():
+        idx = make()
+        print(f"\n===== {name}:", json.dumps(idx.stats()))
+        for q in questions:
+            hits, info = idx.search(q)
+            print("\nQ:", q, "| parts:", info["parts"], "| best sim: %.2f" % info["best_similarity"])
+            for c, s in hits[:3]:
+                print(f"   {s:.2f}  {c.label}: {c.text[:110]}")

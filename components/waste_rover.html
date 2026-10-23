@@ -1,0 +1,664 @@
+<!--
+  The rover's planned waste-collection mode, drawn in the browser.
+  - Navigation is the same idea as our real rover: a 2D LiDAR builds the map, A* plans the path.
+  - Litter appears on the ground (by itself, or where you click). The forward camera spots it.
+  - Each litter photo is a real photo from the TACO dataset (CC BY 4.0), and the label and
+    confidence shown are what OUR model really said about that photo. Wrong answers are kept.
+  - Less than 55% sure: the rover stops and asks you which bin.
+  - It carries up to 3 items, then takes them to the matching bin at the base.
+  - It patrols more where it has found litter before (the heat map).
+  The camera and arm are future hardware. This part is a simulation.
+  Note: inside the script, "<" before a letter or "/" is written as \x3c. Streamlit's HTML cleaner
+  removes any script whose text looks like it contains HTML tags, so keep it that way when editing.
+-->
+<div class="wr" id="wr-root">
+  <div class="wr-bar">
+    <div class="wr-status" aria-live="polite">Starting</div>
+    <div class="wr-ctrl">
+      <button type="button" data-act="play">Pause</button>
+      <button type="button" data-act="heat" aria-pressed="true">Heat map</button>
+    </div>
+  </div>
+  <div class="wr-stage">
+    <canvas class="wr-canvas" aria-label="Simulation: the rover finds litter with its camera, picks it up and sorts it into four bins. Click the map to drop litter."></canvas>
+    <div class="wr-ask" hidden>
+      <div class="wr-ask-top">
+        <img alt="">
+        <div><div class="wr-ask-h">Not sure. Please help</div><div class="wr-ask-m"></div></div>
+      </div>
+      <div class="wr-ask-q">Which bin should this go in?</div>
+      <div class="wr-ask-btns"></div>
+      <div class="wr-ask-time"><i></i></div>
+      <div class="wr-ask-note">No answer in 8 seconds: it uses the model's best guess.</div>
+    </div>
+  </div>
+  <div class="wr-panel">
+    <div class="wr-feed">
+      <h4>What the camera saw</h4>
+      <div class="wr-cards"><div class="wr-empty">Nothing yet. The camera is looking.</div></div>
+    </div>
+    <div class="wr-tally">
+      <h4>Sorting so far</h4>
+      <div class="wr-bins"></div>
+      <div class="wr-stats"></div>
+    </div>
+  </div>
+</div>
+<style>
+  .wr { --ink: #161D21; --muted: #566166; --line: #D2D5CD; --panel: #F7F8F4;
+    font-family: 'Source Sans 3', system-ui, sans-serif; color: var(--ink); }
+  .wr-stage { position: relative; border: 1px solid var(--line); border-radius: 4px; overflow: hidden;
+    background: #CDD0C8; cursor: crosshair; touch-action: manipulation; }
+  .wr-canvas { display: block; width: 100%; height: auto; }
+  .wr-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; min-height: 30px; }
+  .wr-status { display: flex; align-items: center; gap: 8px; font-size: 14.5px; font-weight: 600; line-height: 1.3; min-width: 0; }
+  .wr-status::before { content: ""; flex: none; width: 9px; height: 9px; border-radius: 50%; background: #0F8B8D;
+    box-shadow: 0 0 0 3px rgba(15,139,141,.2); }
+  .wr-ctrl { display: flex; gap: 6px; flex: none; }
+  .wr-ctrl button { font: 600 13px 'Source Sans 3', sans-serif; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 3px; padding: 4px 11px; cursor: pointer; }
+  .wr-ctrl button[aria-pressed="true"] { background: #D9661F; border-color: #D9661F; color: #fff; }
+  .wr-ctrl button:focus-visible, .wr-ask button:focus-visible { outline: 3px solid #0F8B8D; outline-offset: 2px; }
+
+  .wr-ask { position: absolute; right: 10px; top: 10px; width: 290px; background: #fff; border: 1px solid var(--line);
+    border-top: 5px solid #C77D0A; box-shadow: 6px 6px 0 rgba(199,125,10,.28); padding: 10px 12px 10px; cursor: default; }
+  .wr-ask[hidden] { display: none; }
+  .wr-ask-top { display: grid; grid-template-columns: 64px 1fr; gap: 10px; align-items: center; }
+  .wr-ask-top img { width: 64px; height: 64px; object-fit: cover; display: block; background: #CDD0C8; }
+  .wr-ask-h { font: 700 15px/1.25 'Bricolage Grotesque', sans-serif; color: #8A5A00; }
+  .wr-ask-m { font-size: 13px; color: var(--muted); line-height: 1.35; margin-top: 2px; }
+  .wr-ask-q { font-size: 13.5px; font-weight: 600; margin: 9px 0 6px; }
+  .wr-ask-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .wr-ask-btns button { --c: #1E8F55; font: 700 13px 'Source Sans 3', sans-serif; color: #fff; background: var(--c);
+    border: 0; border-radius: 3px; padding: 6px 6px; cursor: pointer; position: relative; }
+  .wr-ask-btns button.guess::after { content: "model's guess"; display: block; font-weight: 400; font-size: 11px; opacity: .9; }
+  .wr-ask-time { height: 4px; background: #E4E6E0; margin-top: 9px; border-radius: 2px; overflow: hidden; }
+  .wr-ask-time i { display: block; height: 100%; width: 100%; background: #C77D0A; }
+  .wr-ask-note { font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+
+  .wr-panel { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; margin-top: 14px; }
+  .wr h4 { font: 700 15px 'Bricolage Grotesque', sans-serif; margin: 0 0 8px; padding: 0; color: var(--ink); }
+  .wr-cards { display: grid; gap: 8px; }
+  .wr-empty { font-size: 14px; color: var(--muted); padding: 10px 12px; background: var(--panel); border: 1px dashed var(--line); }
+  .wr-card { --c: #1E8F55; display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 10px; align-items: start;
+    background: color-mix(in srgb, var(--c) 6%, var(--panel)); border-left: 4px solid var(--c); padding: 7px 10px 7px 7px;
+    animation: wr-in .35s ease both; }
+  .wr-card img { width: 58px; height: 58px; object-fit: cover; display: block; background: #CDD0C8; }
+  .wr-card .t { font: 700 14.5px/1.25 'Bricolage Grotesque', sans-serif; }
+  .wr-card .t span { font: 600 13px 'Source Sans 3', sans-serif; color: var(--muted); margin-left: 4px; }
+  .wr-card .chip { display: inline-block; font-size: 11.5px; font-weight: 700; color: #fff; background: var(--c);
+    padding: 0 6px; border-radius: 3px; margin-right: 5px; line-height: 1.6; }
+  .wr-card .u { font-size: 12px; font-weight: 700; color: #8A5A00; }
+  .wr-card .g { font-size: 12.5px; color: var(--muted); margin-top: 2px; line-height: 1.35; }
+  .wr-card .r { font-size: 12.5px; font-weight: 600; margin-top: 2px; line-height: 1.35; }
+  .wr-card .r.ok { color: #17744A; } .wr-card .r.no { color: #B81F35; }
+  @keyframes wr-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
+  .wr-bins { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .wr-bins div { --c: #1E8F55; border-top: 4px solid var(--c); background: color-mix(in srgb, var(--c) 8%, var(--panel));
+    padding: 6px 8px 7px; min-width: 0; }
+  .wr-bins b { display: block; font: 700 24px/1 'Bricolage Grotesque', sans-serif; color: color-mix(in srgb, var(--c) 78%, #000);
+    font-variant-numeric: tabular-nums; }
+  .wr-bins span { font-size: 12px; color: var(--muted); display: block; margin-top: 3px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .wr-stats { display: grid; grid-template-columns: 1fr auto; margin-top: 10px; font-size: 13.5px; }
+  .wr-stats div { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .wr-stats div:nth-child(odd) { color: var(--muted); }
+  .wr-stats div:nth-child(even) { font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+  @media (max-width: 640px) {
+    .wr-panel { grid-template-columns: 1fr; }
+    .wr-status { font-size: 13px; }
+    .wr-ctrl button { font-size: 12px; padding: 3px 8px; }
+    .wr-ask { left: 8px; right: 8px; width: auto; top: auto; bottom: 8px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .wr-card { animation: none; } }
+</style>
+<script>
+(function () {
+  const root = document.getElementById("wr-root");
+  if (!root || root.dataset.ready) return;
+  root.dataset.ready = "1";
+
+  const CFG = __WR_DATA__;            // filled in by the page: photos, model results, labels, colours
+  const LABELS = CFG.labels, STREAMS = CFG.streams, SURE = CFG.sure, BASE = CFG.base;
+  const ORDER = ["wet", "dry", "hazardous", "ewaste"];
+  const streamOf = (cls) => LABELS[cls][1];
+
+  // ---------- world (metres): an open yard, 12 m x 6 m, 10 cm cells ----------
+  const CELL = 0.1, W = 120, H = 60, RANGE = 4.0, SCAN_HZ = 7;
+  const CAM_RANGE = 2.0, CAM_HALF = 35 * Math.PI / 180;     // forward camera: 70 degree view
+  const CAP = 3;                                            // items it can carry at once
+  const truth = new Uint8Array(W * H), known = new Int8Array(W * H).fill(-1), nearOcc = new Uint8Array(W * H);
+  const idx = (cx, cy) => cy * W + cx;
+  const inside = (cx, cy) => cx >= 0 && cy >= 0 && cx < W && cy < H;
+  const solidAt = (x, y) => { const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL); return !inside(cx, cy) || truth[idx(cx, cy)] === 1; };
+  function block(x0, y0, x1, y1) {
+    for (let cy = Math.floor(y0 / CELL); cy < Math.ceil(y1 / CELL); cy++)
+      for (let cx = Math.floor(x0 / CELL); cx < Math.ceil(x1 / CELL); cx++)
+        if (inside(cx, cy)) truth[idx(cx, cy)] = 1;
+  }
+  block(0, 0, 12, 0.12); block(0, 5.88, 12, 6); block(0, 0, 0.12, 6); block(11.88, 0, 12, 6);
+  const BINS = { wet: [0.12, 0.6, 0.52, 1.2], dry: [0.12, 1.9, 0.52, 2.5], hazardous: [0.12, 3.5, 0.52, 4.1], ewaste: [0.12, 4.8, 0.52, 5.4] };
+  for (const s of ORDER) block(...BINS[s]);
+  const OBST = [[3.0, 0.9, 3.7, 1.6], [5.4, 1.7, 5.9, 2.2], [2.6, 3.9, 2.9, 5.2], [4.6, 4.5, 6.2, 4.8],
+                [7.0, 2.4, 7.4, 2.8], [8.6, 0.12, 8.75, 2.2], [9.9, 3.6, 10.9, 4.4]];
+  for (const o of OBST) block(...o);
+  const dock = (s) => [0.98, (BINS[s][1] + BINS[s][3]) / 2];
+  // places where people sit or queue, so litter is more likely there
+  const HOT = [[5.4, 4.15], [2.25, 4.6], [10.4, 3.15], [9.3, 1.1], [3.35, 2.0]];
+  const TOUR = [[2.4, 1.0], [4.2, 3.0], [6.6, 1.0], [7.8, 4.2], [9.6, 2.6], [11.2, 1.0], [11.2, 5.0], [8.4, 5.2], [4.0, 5.4], [2.0, 3.0]];
+  const tourSeen = TOUR.map(() => 0);
+
+  // ---------- rover ----------
+  const rover = { x: 1.25, y: 3.0, th: 0 };
+  const FOOT = [0.15, 0.13];
+  let path = [], goal = null, mode = "patrol", task = null, status = "", carry = [];
+  let simT = 0, playing = true, visible = true, heatOn = true;
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- litter ----------
+  const deck = CFG.items.map((d, i) => i);
+  const first = deck.splice(0, 3);
+  for (let i = deck.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [deck[i], deck[j]] = [deck[j], deck[i]]; }
+  deck.unshift(...first);
+  let deckPos = 0, nextSpawn = 2.5, uid = 0;
+  const items = [];
+  const imgCache = {};
+  const photo = (d) => { if (!imgCache[d.f]) { const im = new Image(); im.src = BASE + d.f; imgCache[d.f] = im; } return imgCache[d.f]; };
+  const stats = { spotted: 0, binned: 0, right: 0, asked: 0, you: 0 };
+  const binCount = { wet: 0, dry: 0, hazardous: 0, ewaste: 0 };
+  const HC = 0.5, HW = 24, HH = 12, heat = new Float32Array(HW * HH);   // heat map, 50 cm cells
+  CFG.items.forEach(photo);                                          // load the photos early
+
+  function freeSpot(x, y, clear) {
+    if (x < 1.8 || x > 11.7 || y < 0.35 || y > 5.65) return false;
+    for (let a = 0; a < 6.283; a += 0.785) if (solidAt(x + clear * Math.cos(a), y + clear * Math.sin(a))) return false;
+    if (solidAt(x, y)) return false;
+    for (const it of items) if ((it.state === "floor" || it.state === "seen") && Math.hypot(it.x - x, it.y - y) < 0.45) return false;
+    return Math.hypot(rover.x - x, rover.y - y) > 0.5;
+  }
+  function spawn(x, y, byUser) {
+    const d = CFG.items[deck[deckPos++ % deck.length]];
+    photo(d);
+    items.push({ id: ++uid, d, x, y, state: "floor", born: simT, bin: null, how: "", card: null, skipUntil: 0 });
+    if (byUser) status = "You dropped litter. The rover will notice it when its camera sees it";
+  }
+  function autoSpawn() {
+    const onFloor = items.filter((i) => i.state === "floor" || i.state === "seen").length;
+    if (onFloor >= 6) return;
+    for (let k = 0; k < 40; k++) {
+      let x, y;
+      if (Math.random() < 0.65) { const h = HOT[Math.floor(Math.random() * HOT.length)]; x = h[0] + (Math.random() - 0.5) * 1.3; y = h[1] + (Math.random() - 0.5) * 1.1; }
+      else { x = 1.9 + Math.random() * 9.8; y = 0.4 + Math.random() * 5.2; }
+      if (freeSpot(x, y, 0.3)) { spawn(x, y, false); return; }
+    }
+  }
+
+  // ---------- canvas ----------
+  const stage = root.querySelector(".wr-stage");
+  const canvas = root.querySelector("canvas"), ctx = canvas.getContext("2d");
+  const statusEl = root.querySelector(".wr-status");
+  const mapImg = document.createElement("canvas"); mapImg.width = W; mapImg.height = H;
+  const mctx = mapImg.getContext("2d"), img = mctx.createImageData(W, H);
+  const COL = { unknown: [205, 208, 200], free: [247, 248, 244], occ: [22, 29, 33], zone: [244, 228, 231] };
+  let scale = 8, dpr = 1, portrait = false;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = stage.clientWidth || 800;
+    portrait = w < 560;
+    scale = portrait ? w / H : w / W;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round((portrait ? W : H) * scale * dpr);
+    canvas.style.height = ((portrait ? W : H) * scale) + "px";
+    if (!playing || !visible) draw();
+  }
+  function view(k) { if (portrait) ctx.setTransform(0, k, -k, 0, canvas.width, 0); else ctx.setTransform(k, 0, 0, k, 0, 0); }
+  const pxm = () => scale * dpr / CELL;                                  // device pixels per metre
+  function toScreen(x, y) { const s = pxm(); return portrait ? [canvas.width - s * y, s * x] : [s * x, s * y]; }
+  new ResizeObserver(resize).observe(stage);
+
+  function paintCell(i) {
+    let c = COL.unknown;
+    if (known[i] === 1) c = COL.occ; else if (known[i] === 0) c = nearOcc[i] ? COL.zone : COL.free;
+    img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1]; img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = 255;
+  }
+  for (let i = 0; i < W * H; i++) paintCell(i);
+
+  // ---------- LiDAR scan (builds the map) ----------
+  let points = [];
+  function scan() {
+    const lx = rover.x, ly = rover.y, hits = [], newOcc = [];
+    for (let a = 0; a < 360; a += 1.5) {
+      const ang = rover.th + a * Math.PI / 180, dx = Math.cos(ang), dy = Math.sin(ang);
+      for (let r = 0.05; r < RANGE; r += 0.04) {
+        const px = lx + dx * r, py = ly + dy * r, cx = Math.floor(px / CELL), cy = Math.floor(py / CELL);
+        if (!inside(cx, cy)) break;
+        const i = idx(cx, cy);
+        if (truth[i]) { if (known[i] !== 1) { known[i] = 1; newOcc.push([cx, cy]); paintCell(i); }
+          const n = (Math.random() - 0.5) * 0.03; hits.push([px + dx * n, py + dy * n]); break; }
+        if (known[i] === -1) { known[i] = 0; paintCell(i); }
+      }
+    }
+    for (const [cx, cy] of newOcc)
+      for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+        const nx = cx + ox, ny = cy + oy;
+        if (inside(nx, ny) && ox * ox + oy * oy <= 5) { const j = idx(nx, ny); nearOcc[j] = 1; paintCell(j); }
+      }
+    mctx.putImageData(img, 0, 0);
+    points = hits;
+  }
+
+  // ---------- A* planner ----------
+  function plan(gx, gy) {
+    const b = new Uint8Array(W * H);
+    for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
+      if (known[idx(cx, cy)] !== 1) continue;
+      for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+        const nx = cx + ox, ny = cy + oy; if (inside(nx, ny) && ox * ox + oy * oy <= 5) b[idx(nx, ny)] = 1; }
+    }
+    const sx = Math.floor(rover.x / CELL), sy = Math.floor(rover.y / CELL), tx = Math.floor(gx / CELL), ty = Math.floor(gy / CELL);
+    if (!inside(tx, ty)) return null;
+    b[idx(sx, sy)] = 0; b[idx(tx, ty)] = 0;
+    const g = new Float32Array(W * H).fill(Infinity), from = new Int32Array(W * H).fill(-1), heap = [];
+    const push = (i, f) => { heap.push([f, i]); let k = heap.length - 1;
+      while (k > 0) { const p = (k - 1) >> 1; if (heap[p][0] <= heap[k][0]) break; [heap[p], heap[k]] = [heap[k], heap[p]]; k = p; } };
+    const pop = () => { const top = heap[0], last = heap.pop();
+      if (heap.length) { heap[0] = last; let k = 0;
+        for (;;) { const l = 2 * k + 1, r = l + 1; let m = k;
+          if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+          if (m === k) break; [heap[m], heap[k]] = [heap[k], heap[m]]; k = m; } }
+      return top; };
+    const hfn = (cx, cy) => { const dx = Math.abs(cx - tx), dy = Math.abs(cy - ty); return Math.max(dx, dy) + 0.414 * Math.min(dx, dy); };
+    const start = idx(sx, sy), target = idx(tx, ty);
+    g[start] = 0; push(start, hfn(sx, sy));
+    const D = [[1,0,1],[-1,0,1],[0,1,1],[0,-1,1],[1,1,1.414],[1,-1,1.414],[-1,1,1.414],[-1,-1,1.414]];
+    let steps = 0;
+    while (heap.length && steps++ < 60000) {
+      const [, cur] = pop(); if (cur === target) break;
+      const cx = cur % W, cy = (cur / W) | 0;
+      for (const [ox, oy, c] of D) {
+        const nx = cx + ox, ny = cy + oy; if (!inside(nx, ny)) continue;
+        const j = idx(nx, ny); if (b[j]) continue;
+        const ng = g[cur] + c * (known[j] === -1 ? 1.6 : 1) + (nearOcc[j] ? 0.8 : 0);
+        if (ng < g[j]) { g[j] = ng; from[j] = cur; push(j, ng + hfn(nx, ny)); }
+      }
+    }
+    if (from[target] === -1 && target !== start) return null;
+    const out = [];
+    for (let c = target; c !== -1; c = from[c]) out.push([(c % W + 0.5) * CELL, (((c / W) | 0) + 0.5) * CELL]);
+    out.reverse(); out[out.length - 1] = [gx, gy];
+    return out;
+  }
+  let planAcc = 0, bestDist = Infinity, stuckT = 0;
+  function setGoal(x, y, stop) {
+    goal = { x, y, stop }; path = plan(x, y) || []; bestDist = Infinity; stuckT = 0;
+    return path.length > 0;
+  }
+  // Follows the path. Returns "arrived", "stuck" or "" (still driving).
+  function drive(dt) {
+    if (!goal) return "arrived";
+    const dist = Math.hypot(goal.x - rover.x, goal.y - rover.y);
+    if (dist < goal.stop) { path = []; goal = null; return "arrived"; }
+    if (dist < bestDist - 0.05) { bestDist = dist; stuckT = 0; } else if ((stuckT += dt) > 5) return "stuck";
+    if (!path.length) return "stuck";
+    while (path.length > 1 && Math.hypot(path[0][0] - rover.x, path[0][1] - rover.y) < 0.35) path.shift();
+    let tgt = path[path.length - 1];
+    for (const p of path) if (Math.hypot(p[0] - rover.x, p[1] - rover.y) > 0.45) { tgt = p; break; }
+    let err = Math.atan2(tgt[1] - rover.y, tgt[0] - rover.x) - rover.th;
+    err = Math.atan2(Math.sin(err), Math.cos(err));
+    let v = 0; const w = Math.max(-2.2, Math.min(2.2, 3.0 * err));
+    if (Math.abs(err) < 0.9) v = 0.85 * (1 - Math.abs(err) / 1.1);
+    if (dist < 0.5) v = Math.min(v, 0.15 + dist * 0.8);
+    const nx = rover.x + v * Math.cos(rover.th) * dt, ny = rover.y + v * Math.sin(rover.th) * dt;
+    if (!solidAt(nx, ny)) { rover.x = nx; rover.y = ny; }
+    rover.th += w * dt;
+    return "";
+  }
+  function turnTo(ang, dt) {
+    let err = Math.atan2(Math.sin(ang - rover.th), Math.cos(ang - rover.th));
+    rover.th += Math.max(-2.4, Math.min(2.4, 4 * err)) * dt;
+    return Math.abs(err) < 0.08;
+  }
+
+  // ---------- camera: is a litter item inside the forward view, with nothing in between? ----------
+  function inView(it) {
+    const cx = rover.x + 0.14 * Math.cos(rover.th), cy = rover.y + 0.14 * Math.sin(rover.th);
+    const dx = it.x - cx, dy = it.y - cy, r = Math.hypot(dx, dy);
+    if (r > CAM_RANGE) return false;
+    const a = Math.atan2(Math.sin(Math.atan2(dy, dx) - rover.th), Math.cos(Math.atan2(dy, dx) - rover.th));
+    if (Math.abs(a) > CAM_HALF) return false;
+    for (let t = 0.1; t < r; t += 0.05) if (solidAt(cx + dx * t / r, cy + dy * t / r)) return false;
+    return true;
+  }
+  function spotted(it) {
+    it.state = "seen"; it.seenAt = simT; stats.spotted++;
+    const hx = Math.floor(it.x / HC), hy = Math.floor(it.y / HC);
+    heat[hy * HW + hx] += 1;
+    it.card = addCard(it);
+  }
+
+  // ---------- the panel under the map ----------
+  const cardsEl = root.querySelector(".wr-cards"), binsEl = root.querySelector(".wr-bins"), statsEl = root.querySelector(".wr-stats");
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  function addCard(it) {
+    const d = it.d, s = STREAMS[streamOf(d.pred)], sure = d.score >= SURE;
+    const el = document.createElement("div");
+    el.className = "wr-card"; el.style.setProperty("--c", s.colour);
+    el.innerHTML = `\x3cimg src="${esc(BASE + d.f)}" alt="Litter photo: ${esc(d.taco)}">\x3cdiv>` +
+      `\x3cdiv class="t">${esc(LABELS[d.pred][0])}\x3cspan>${Math.round(d.score * 100)}% sure\x3c/span>\x3c/div>` +
+      `\x3cdiv>\x3cspan class="chip">${esc(s.name)}\x3c/span>${sure ? "" : '\x3cspan class="u">not sure, will ask\x3c/span>'}\x3c/div>` +
+      `\x3cdiv class="g">Dataset label: ${esc(d.taco)}\x3c/div>\x3cdiv class="r">Spotted. Going to pick it up\x3c/div>\x3c/div>`;
+    const empty = cardsEl.querySelector(".wr-empty"); if (empty) empty.remove();
+    cardsEl.prepend(el);
+    while (cardsEl.children.length > 3) cardsEl.lastElementChild.remove();
+    return el;
+  }
+  function cardNote(it, text, cls) {
+    if (!it.card) return; const r = it.card.querySelector(".r");
+    r.textContent = text; r.className = "r" + (cls ? " " + cls : "");
+  }
+  let tallyKey = "";
+  function renderTally() {
+    const key = JSON.stringify([binCount, stats]);
+    if (key === tallyKey) return; tallyKey = key;
+    binsEl.innerHTML = ORDER.map((s) => `\x3cdiv style="--c:${STREAMS[s].colour}">\x3cb>${binCount[s]}\x3c/b>\x3cspan>${esc(STREAMS[s].short)}\x3c/span>\x3c/div>`).join("");
+    const pct = stats.binned ? ` (${Math.round(100 * stats.right / stats.binned)}%)` : "";
+    statsEl.innerHTML = `\x3cdiv>Spotted by the camera\x3c/div>\x3cdiv>${stats.spotted}\x3c/div>` +
+      `\x3cdiv>Put in a bin\x3c/div>\x3cdiv>${stats.binned}\x3c/div>` +
+      `\x3cdiv>Right bin, checked against the dataset label\x3c/div>\x3cdiv>${stats.right} of ${stats.binned}${pct}\x3c/div>` +
+      `\x3cdiv>Asked you for help\x3c/div>\x3cdiv>${stats.asked}${stats.asked ? `, you answered ${stats.you}` : ""}\x3c/div>`;
+  }
+
+  // ---------- asking the visitor ----------
+  const askEl = root.querySelector(".wr-ask"), askBtns = askEl.querySelector(".wr-ask-btns"), askBar = askEl.querySelector(".wr-ask-time i");
+  let askItem = null, askLeft = 0;
+  const ASK_TIME = 8;
+  function openAsk(it) {
+    askItem = it; askLeft = ASK_TIME; stats.asked++;
+    const d = it.d, guess = streamOf(d.pred);
+    askEl.querySelector("img").src = BASE + d.f;
+    askEl.querySelector(".wr-ask-m").textContent = `The model thinks: ${LABELS[d.pred][0]}, only ${Math.round(d.score * 100)}% sure.`;
+    askBtns.innerHTML = ORDER.map((s) => `\x3cbutton type="button" data-s="${s}" class="${s === guess ? "guess" : ""}" style="--c:${STREAMS[s].colour}">${esc(STREAMS[s].name)}\x3c/button>`).join("");
+    askEl.hidden = false;
+    cardNote(it, "Waiting for your answer");
+  }
+  function closeAsk(s, byYou) {
+    const it = askItem; if (!it) return;
+    askItem = null; askEl.hidden = true;
+    it.bin = s; it.how = byYou ? "you" : "guess";
+    if (byYou) stats.you++;
+    cardNote(it, byYou ? `You chose: ${STREAMS[s].name}` : `No answer, using the model's guess: ${STREAMS[s].name}`);
+    mode = "pick"; task.t0 = simT;
+  }
+  askBtns.addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) closeAsk(b.dataset.s, true); });
+  askEl.addEventListener("click", (e) => e.stopPropagation());
+
+  // ---------- deciding what to do next ----------
+  const PRIORITY = { hazardous: 0, ewaste: 1, wet: 2, dry: 3 };
+  function chooseTask() {
+    const waiting = items.filter((i) => i.state === "seen" && i.skipUntil <= simT);
+    if (carry.length && (carry.length >= CAP || !waiting.length)) {
+      const need = [...new Set(carry.map((i) => i.bin))];
+      need.sort((a, b) => Math.hypot(dock(a)[0] - rover.x, dock(a)[1] - rover.y) - Math.hypot(dock(b)[0] - rover.x, dock(b)[1] - rover.y));
+      const s = need[0], [dx, dy] = dock(s);
+      task = { kind: "bin", s }; mode = "toBin"; setGoal(dx, dy, 0.12);
+      const n = carry.filter((i) => i.bin === s).length;
+      status = `Taking ${n === 1 ? "1 item" : n + " items"} to the ${STREAMS[s].name.toLowerCase()} bin`;
+      return;
+    }
+    if (waiting.length) {
+      waiting.sort((a, b) => (PRIORITY[streamOf(a.d.pred)] - PRIORITY[streamOf(b.d.pred)]) ||
+        (Math.hypot(a.x - rover.x, a.y - rover.y) - Math.hypot(b.x - rover.x, b.y - rover.y)));
+      const it = waiting[0];
+      task = { kind: "item", it }; mode = "toItem";
+      if (!setGoal(it.x, it.y, 0.3)) { it.skipUntil = simT + 6; task = null; mode = "patrol"; return; }
+      const hz = streamOf(it.d.pred) === "hazardous" ? " Hazardous first." : "";
+      status = `Going to pick up: ${LABELS[it.d.pred][0].toLowerCase()} (${Math.round(it.d.score * 100)}%).${hz}`;
+      return;
+    }
+    // Patrol: go where it has not been for a while, more often where it found litter before.
+    let best = 0, bestScore = -1;
+    TOUR.forEach((p, i) => {
+      let h = 0;
+      for (let y = 0; y < HH; y++) for (let x = 0; x < HW; x++) {
+        const v = heat[y * HW + x]; if (!v) continue;
+        if (Math.hypot((x + 0.5) * HC - p[0], (y + 0.5) * HC - p[1]) < 1.6) h += v;
+      }
+      const sc = (simT - tourSeen[i] + 1) * (1 + 0.6 * h) * (Math.hypot(p[0] - rover.x, p[1] - rover.y) > 0.8 ? 1 : 0);
+      if (sc > bestScore) { bestScore = sc; best = i; }
+    });
+    task = { kind: "patrol", i: best }; mode = "patrol";
+    setGoal(TOUR[best][0], TOUR[best][1], 0.25);
+    status = "Patrolling. The camera is looking for litter";
+  }
+
+  function step(dt) {
+    simT += dt;
+    if ((nextSpawn -= dt) <= 0) { autoSpawn(); nextSpawn = 4 + Math.random() * 3; }
+    for (const it of items) if (it.state === "floor" && inView(it)) spotted(it);
+    if ((planAcc += dt) > 0.5 && goal) { planAcc = 0; const p = plan(goal.x, goal.y); if (p) path = p; }
+
+    if (mode === "patrol") {
+      if (items.some((i) => i.state === "seen" && i.skipUntil <= simT) || !task) return chooseTask();
+      const r = drive(dt);
+      if (r) { tourSeen[task.i] = simT; chooseTask(); }
+    } else if (mode === "toItem") {
+      const it = task.it, r = drive(dt);
+      if (r === "arrived") { mode = "align"; status = "Lining up the arm"; }
+      else if (r === "stuck") { it.skipUntil = simT + 6; chooseTask(); }
+    } else if (mode === "align") {
+      const it = task.it;
+      if (turnTo(Math.atan2(it.y - rover.y, it.x - rover.x), dt)) {
+        if (it.d.score < SURE) { mode = "ask"; status = "Not sure what this is. Asking you"; openAsk(it); }
+        else { it.bin = streamOf(it.d.pred); it.how = "model"; mode = "pick"; task.t0 = simT; }
+      }
+    } else if (mode === "ask") {
+      askLeft -= dt; askBar.style.width = Math.max(0, 100 * askLeft / ASK_TIME) + "%";
+      if (askLeft <= 0) closeAsk(streamOf(askItem.d.pred), false);
+    } else if (mode === "pick") {
+      status = "Picking it up";
+      const it = task.it;
+      if (simT - task.t0 > 1.1) {
+        it.state = "carry"; carry.push(it);
+        cardNote(it, `Picked up. Going to the ${STREAMS[it.bin].name.toLowerCase()} bin`);
+        chooseTask();
+      }
+    } else if (mode === "toBin") {
+      const r = drive(dt);
+      if (r === "arrived") { mode = "dockAlign"; }
+      else if (r === "stuck") { setGoal(...dock(task.s), 0.12); }
+    } else if (mode === "dockAlign") {
+      if (turnTo(Math.PI, dt)) {
+        mode = "drop"; task.t0 = simT; task.drop = carry.filter((i) => i.bin === task.s);
+        status = `Dropping into the ${STREAMS[task.s].name.toLowerCase()} bin`;
+      }
+    } else if (mode === "drop") {
+      const list = task.drop, k = Math.floor((simT - task.t0) / 0.55);
+      for (let j = 0; j < Math.min(k, list.length); j++) {
+        const it = list[j]; if (it.state !== "carry") continue;
+        it.state = "binned"; binCount[it.bin]++; stats.binned++;
+        carry = carry.filter((c) => c !== it);
+        const want = streamOf(it.d.truth);
+        if (it.bin === want) { stats.right++; cardNote(it, `In the ${STREAMS[it.bin].name.toLowerCase()} bin. Right bin ✓`, "ok"); }
+        else cardNote(it, `In the ${STREAMS[it.bin].name.toLowerCase()} bin. Wrong ✗ It is ${STREAMS[want].name.toLowerCase()}`, "no");
+      }
+      if (k > list.length) chooseTask();
+    }
+  }
+
+  // ---------- drawing ----------
+  let beam = 0;
+  function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  function drawPhoto(d, X, Y, R, ring, dashed, alpha) {
+    const im = photo(d);
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.arc(X, Y, R, 0, 6.283); ctx.fillStyle = "#fff"; ctx.fill();
+    if (im.complete && im.naturalWidth) {
+      ctx.save(); ctx.beginPath(); ctx.arc(X, Y, R - 1.5 * dpr, 0, 6.283); ctx.clip();
+      const m = Math.min(im.naturalWidth, im.naturalHeight);
+      ctx.drawImage(im, (im.naturalWidth - m) / 2, (im.naturalHeight - m) / 2, m, m, X - R, Y - R, 2 * R, 2 * R);
+      ctx.restore();
+    }
+    ctx.lineWidth = 2.5 * dpr; ctx.strokeStyle = ring; ctx.setLineDash(dashed ? [4 * dpr, 3 * dpr] : []);
+    ctx.beginPath(); ctx.arc(X, Y, R + 1.5 * dpr, 0, 6.283); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+  }
+  function tag(text, X, Y, colour) {
+    ctx.font = `700 ${11 * dpr}px 'Source Sans 3', sans-serif`;
+    const w = ctx.measureText(text).width + 8 * dpr, h = 16 * dpr;
+    let x = Math.max(2, Math.min(canvas.width - w - 2, X - w / 2)), y = Math.max(2, Y - h);
+    ctx.fillStyle = colour; rr(x, y, w, h, 3 * dpr); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillText(text, x + 4 * dpr, y + 12 * dpr);
+  }
+  function draw() {
+    const s = pxm(), k = scale * dpr;
+    ctx.imageSmoothingEnabled = false;
+    view(k); ctx.drawImage(mapImg, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    view(s);
+    // base station area
+    ctx.fillStyle = "rgba(30,143,85,0.07)"; ctx.fillRect(0.12, 0.12, 1.45, 5.76);
+    ctx.strokeStyle = "rgba(30,143,85,0.45)"; ctx.lineWidth = 0.02; ctx.setLineDash([0.08, 0.06]);
+    ctx.beginPath(); ctx.moveTo(1.57, 0.12); ctx.lineTo(1.57, 5.88); ctx.stroke(); ctx.setLineDash([]);
+    // grid
+    ctx.strokeStyle = "rgba(22,29,33,0.06)"; ctx.lineWidth = 1 / s; ctx.beginPath();
+    for (let x = 1; x < 12; x++) { ctx.moveTo(x, 0); ctx.lineTo(x, 6); }
+    for (let y = 1; y < 6; y++) { ctx.moveTo(0, y); ctx.lineTo(12, y); }
+    ctx.stroke();
+    // heat map: where the camera has found litter
+    if (heatOn) {
+      let mx = 0; for (const v of heat) mx = Math.max(mx, v);
+      if (mx) for (let y = 0; y < HH; y++) for (let x = 0; x < HW; x++) {
+        const v = heat[y * HW + x]; if (!v) continue;
+        const cx = (x + 0.5) * HC, cy = (y + 0.5) * HC, a = (0.16 + 0.42 * v / mx).toFixed(3);
+        const hg = ctx.createRadialGradient(cx, cy, 0, cx, cy, 0.55);
+        hg.addColorStop(0, `rgba(217,102,31,${a})`); hg.addColorStop(1, "rgba(217,102,31,0)");
+        ctx.fillStyle = hg; ctx.beginPath(); ctx.arc(cx, cy, 0.55, 0, 6.283); ctx.fill();
+      }
+    }
+    // bins
+    for (const st of ORDER) { const b = BINS[st]; ctx.fillStyle = STREAMS[st].colour; ctx.fillRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); }
+    // path
+    if (path.length) {
+      ctx.strokeStyle = "#1E8F55"; ctx.lineWidth = 0.045; ctx.lineJoin = "round"; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(rover.x, rover.y); for (const p of path) ctx.lineTo(p[0], p[1]); ctx.stroke();
+    }
+    // LiDAR sweep and points
+    const ba = reduce ? rover.th : beam;
+    const grad = ctx.createRadialGradient(rover.x, rover.y, 0, rover.x, rover.y, RANGE);
+    grad.addColorStop(0, "rgba(211,38,62,0.16)"); grad.addColorStop(1, "rgba(211,38,62,0)");
+    ctx.fillStyle = grad; ctx.beginPath(); ctx.moveTo(rover.x, rover.y); ctx.arc(rover.x, rover.y, RANGE, ba - 0.5, ba); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#D3263E";
+    for (const [px, py] of points) { ctx.beginPath(); ctx.arc(px, py, 0.026, 0, 6.283); ctx.fill(); }
+    // camera view
+    const camX = rover.x + 0.14 * Math.cos(rover.th), camY = rover.y + 0.14 * Math.sin(rover.th);
+    const cg = ctx.createRadialGradient(camX, camY, 0, camX, camY, CAM_RANGE);
+    cg.addColorStop(0, "rgba(15,139,141,0.30)"); cg.addColorStop(1, "rgba(15,139,141,0.04)");
+    ctx.fillStyle = cg; ctx.beginPath(); ctx.moveTo(camX, camY); ctx.arc(camX, camY, CAM_RANGE, rover.th - CAM_HALF, rover.th + CAM_HALF); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(15,139,141,0.55)"; ctx.lineWidth = 0.015; ctx.stroke();
+    // arm reaching for the item
+    if (mode === "pick" && task && task.it) {
+      const it = task.it, f = Math.min(1, (simT - task.t0) / 0.5);
+      ctx.strokeStyle = "#161D21"; ctx.lineWidth = 0.035; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(camX, camY);
+      const back = simT - task.t0 > 0.55 ? Math.max(0, 1 - (simT - task.t0 - 0.55) / 0.5) : f;
+      ctx.lineTo(camX + (it.x - camX) * back, camY + (it.y - camY) * back); ctx.stroke();
+    }
+    // the rover, real size
+    ctx.save(); ctx.translate(rover.x, rover.y); ctx.rotate(rover.th);
+    ctx.fillStyle = "#161D21"; ctx.fillRect(-FOOT[0], -FOOT[1], FOOT[0] * 2, FOOT[1] * 2);
+    ctx.fillStyle = "#D3263E"; ctx.beginPath(); ctx.arc(0, 0, 0.045, 0, 6.283); ctx.fill();
+    ctx.fillStyle = "#0F8B8D"; ctx.fillRect(0.11, -0.035, 0.05, 0.07);
+    ctx.restore();
+
+    // ----- screen-space parts (upright text and photos, also when the map is turned on phones) -----
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const R = Math.max(9 * dpr, 0.22 * s);
+    // bin letters and counts
+    for (const st of ORDER) {
+      const b = BINS[st], [X, Y] = toScreen((b[0] + b[2]) / 2, (b[1] + b[3]) / 2);
+      ctx.fillStyle = "#fff"; ctx.textAlign = "center";
+      ctx.font = `800 ${Math.max(11, 0.2 * s / dpr) * dpr}px 'Bricolage Grotesque', sans-serif`;
+      ctx.fillText(String(binCount[st]), X, Y + 4 * dpr);
+    }
+    ctx.textAlign = "left";
+    { const [X, Y] = toScreen(portrait ? 0.32 : 1.0, portrait ? 3.0 : 0.36); ctx.fillStyle = "#17744A"; ctx.textAlign = "center";
+      ctx.font = `700 ${11 * dpr}px 'Source Sans 3', sans-serif`; ctx.fillText("BASE", X, Y + 4 * dpr); ctx.textAlign = "left"; }
+    // litter on the ground
+    for (const it of items) {
+      if (it.state !== "floor" && it.state !== "seen") continue;
+      let x = it.x, y = it.y, scaleK = 1, alpha = 1;
+      if (mode === "pick" && task && task.it === it && simT - task.t0 > 0.55) {
+        const f = Math.min(1, (simT - task.t0 - 0.55) / 0.5);
+        x += (camX - x) * f; y += (camY - y) * f; scaleK = 1 - 0.6 * f;
+      }
+      const age = simT - it.born; if (age < 0.4) { scaleK *= 1 + 0.6 * (1 - age / 0.4); alpha = age / 0.4; }
+      const [X, Y] = toScreen(x, y);
+      if (it.state === "floor") drawPhoto(it.d, X, Y, R * scaleK, "#8C948F", false, alpha * 0.92);
+      else {
+        const st = streamOf(it.d.pred), sure = it.d.score >= SURE;
+        drawPhoto(it.d, X, Y, R * scaleK, STREAMS[st].colour, !sure, alpha);
+        if (scaleK > 0.9) tag(`${it.d.pred[0].toUpperCase() + it.d.pred.slice(1)} ${Math.round(it.d.score * 100)}%${sure ? "" : "?"}`, X, Y - R - 4 * dpr, STREAMS[st].colour);
+      }
+    }
+    // items being dropped into a bin
+    if (mode === "drop" && task) {
+      task.drop.forEach((it, j) => {
+        const f = (simT - task.t0 - j * 0.55) / 0.55; if (f < 0 || f > 1) return;
+        const b = BINS[task.s], tx = (b[0] + b[2]) / 2, ty = (b[1] + b[3]) / 2;
+        const [X0, Y0] = toScreen(rover.x, rover.y), [X1, Y1] = toScreen(tx, ty);
+        const X = X0 + (X1 - X0) * f, Y = Y0 + (Y1 - Y0) * f - Math.sin(f * Math.PI) * 26 * dpr;
+        drawPhoto(it.d, X, Y, R * (0.7 - 0.4 * f), STREAMS[it.bin].colour, false, 1);
+      });
+    }
+    // what the rover is carrying
+    carry.forEach((it, j) => {
+      if (mode === "drop" && task && task.drop.includes(it) && simT - task.t0 >= task.drop.indexOf(it) * 0.55) return;
+      const [X, Y] = toScreen(rover.x, rover.y);
+      ctx.fillStyle = STREAMS[it.bin].colour; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5 * dpr;
+      ctx.beginPath(); ctx.arc(X + (j - (carry.length - 1) / 2) * 9 * dpr, Y - 0.24 * s, 4 * dpr, 0, 6.283); ctx.fill(); ctx.stroke();
+    });
+    // scale bar
+    const m = s, bx = 14 * dpr, by = canvas.height - 14 * dpr;
+    ctx.fillStyle = "#161D21";
+    ctx.fillRect(bx, by, m, 2 * dpr); ctx.fillRect(bx, by - 5 * dpr, 2 * dpr, 9 * dpr); ctx.fillRect(bx + m - 2 * dpr, by - 5 * dpr, 2 * dpr, 9 * dpr);
+    ctx.font = `600 ${12 * dpr}px 'Source Sans 3', sans-serif`; ctx.fillText("1 m", bx + m / 2 - 9 * dpr, by - 7 * dpr);
+  }
+
+  // ---------- input ----------
+  stage.addEventListener("click", (e) => {
+    if (e.target.closest("button") || e.target.closest(".wr-ask")) return;
+    const r = canvas.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+    const x = portrait ? py / r.height * 12 : px / r.width * 12;
+    const y = portrait ? 6 - px / r.width * 6 : py / r.height * 6;
+    if (freeSpot(x, y, 0.2)) spawn(x, y, true);
+    else status = "Drop litter on open ground, away from walls, bins and the rover";
+    if (!playing) draw();
+  });
+  const playBtn = root.querySelector('[data-act="play"]'), heatBtn = root.querySelector('[data-act="heat"]');
+  playBtn.addEventListener("click", () => { playing = !playing; playBtn.textContent = playing ? "Pause" : "Play"; if (!playing) draw(); });
+  heatBtn.addEventListener("click", () => { heatOn = !heatOn; heatBtn.setAttribute("aria-pressed", String(heatOn)); draw(); });
+
+  // ---------- start ----------
+  scan();
+  for (const h of [HOT[4], HOT[1], HOT[0]]) { const x = h[0] + 0.2, y = h[1]; if (freeSpot(x, y, 0.3)) spawn(x, y, false); else autoSpawn(); }
+  items.forEach((it) => (it.born = -1));
+  if (reduce) { playing = false; playBtn.textContent = "Play"; status = "Press Play to start. Motion is paused because your device asks for less motion"; }
+  renderTally(); resize(); draw(); statusEl.textContent = status;
+  new IntersectionObserver((es) => { visible = es[0].isIntersecting; }).observe(root);
+  let last = performance.now(), scanAcc = 0, uiAcc = 0;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (visible && playing && !document.hidden) {
+      beam += dt * 2 * Math.PI * 1.1;
+      if ((scanAcc += dt) > 1 / SCAN_HZ) { scanAcc = 0; scan(); }
+      step(dt);
+      draw();
+      if ((uiAcc += dt) > 0.2) { uiAcc = 0; statusEl.textContent = status; renderTally(); }
+    } else if (!playing) statusEl.textContent = status;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>

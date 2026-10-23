@@ -17,3 +17,19 @@ Run on 22 Oct 2026 with Groq `openai/gpt-oss-120b`. Each answer came back in abo
 - The number check highlights "10" inside "100" on the page image, because PDF search matches parts of numbers.
 - Asked for the MPU6050 I2C address, the model gave b1101000 (correct, from the datasheet) and added 0x68, its own conversion. The datasheet never writes 0x68, so the number check shows a red warning. The value is right, but the warning is doing its job: it flags any number that did not come from a source.
 - Groq retires models over time. The app now picks a working model by itself if the chosen one is gone.
+
+# WasteVision tests (23 Oct 2026)
+
+**Detector, 18 photos from another public garbage dataset (not its training data):** 7 correct.
+- Correct: 4 of 4 metal cans and tins, newspaper, flyer, foam cup (plastic).
+- Wrong: foil (called cardboard), shredded and black paper, a folded newspaper, and 6 of 6 plastic items (bottles, bags, caps, milk jug).
+- A photo collage of 4 items was seen as one large "paper" item: it works best with real, separated items.
+
+**"Why?" answers (Groq `openai/gpt-oss-120b`), all 8 classes:** every answer cited the rules. Two needed fixes:
+- Medical: the first question mixed sanitary waste and medicines, and the model said "not covered". Asking about expired medicines and domestic hazardous waste fixed it.
+- E-waste: the first answer added advice about batteries that the rules we have do not contain. Asking "who should e-waste be handed over to?" gives the grounded answer: a registered producer, refurbisher or recycler (E-Waste Rules 2022, page 24).
+- A rover question ("What is the rover's top speed?") on the waste page was refused before calling the model, so the two knowledge bases stay separate.
+
+**Detector on real litter photos (TACO, 104 crops, labels from TACO's own annotations):** material right for 36 of 104 (35%), right bin for 89 of 104 (86%), nothing found in 2. Most mistakes stay inside dry waste (for example a plastic bottle called cardboard). Worst: plastic, only 3 of 28 named right.
+
+**Animation (`Watch the rover sort litter`):** ran for 140 seconds in Chrome on desktop and on a phone-sized screen with no errors. It found, picked up and binned 8 items; it asked for help once and the answer was used; dropping litter by clicking worked; a page rerun (uploading a photo) did not reset it; with "reduce motion" turned on it waits for Play.

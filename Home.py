@@ -37,7 +37,9 @@ specs = "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in site["specs"])
 st.markdown(f'<div class="rv-about"><p>{esc(site["intro"].strip())}</p>'
             f'<dl class="rv-specs">{specs}</dl></div>', unsafe_allow_html=True)
 st.write("")
-st.page_link("pages/1_Ask_the_Rover.py", label="Ask a question about the rover", icon="💬")
+c1, c2 = st.columns([1, 1.6])
+c1.page_link("pages/1_Ask_the_Rover.py", label="Ask a question about the rover", icon="💬")
+c2.page_link("pages/2_WasteVision.py", label="Also from our team: WasteVision, waste sorting from a photo", icon="♻️")
 
 # ---------------- photos of the finished rover ----------------
 photos = photo_files("photos")

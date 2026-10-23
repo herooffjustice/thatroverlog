@@ -6,3 +6,5 @@ faiss-cpu
 fastembed
 numpy
 requests
+onnxruntime
+pillow
